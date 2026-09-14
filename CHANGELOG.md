@@ -4,6 +4,7 @@
 
 - Update desktop documentation with platform-specific setup, direct-versus-relay connection guidance, Windows connector limits, and the current discovery API; remove workspace-era navigation and installation hints, and emit the docs 404 page at the correct path.
 - Redesign the public website, documentation, sign-in, and desktop companion with responsive layouts and a shared visual system; put mobile authentication first, retain failed token input, and make connector authorization, completion, and recovery pages work on phone screens.
+- Stop stalled browser sign-in, desktop discovery, and access-management requests after 30 seconds while retaining caller cancellation, thanks @SebTardif (#124).
 - Add Linux VAAPI/NVENC video selection with recoverable software fallback, negotiated live desktop sizing with decoder resets and opt-in supported mode changes, simultaneous X11/Wayland/portal monitor sharing, and an administrator-configured SDDM Wayland greeter wrapper with separate authenticated state and bounded helper cleanup.
 - Focus Crabfleet on native VNC and private desktop sharing: remove the Codex board, workspace runtimes, terminals, agent CLI/SSH gateway, and related deployment machinery; retain desktop sign-in, discovery, host publication, and the browser VNC relay.
 - Keep Linux HEVC video in the browser-compatible Main profile while preserving independently decodable frames, avoiding an unnecessary H.264 fallback; label shared-desktop keyboard and clipboard controls correctly for Linux as well as Mac hosts.
