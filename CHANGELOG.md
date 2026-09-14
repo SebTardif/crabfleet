@@ -10,6 +10,7 @@
 - Run native validation for the current OS with `pnpm test:native`, including Go race tests and vet, plus Swift suites on macOS; make local Linux validation independent of Crabbox authentication or Mac runner access.
 - Add a Linux desktop connector with X11, Hyprland/wlroots and GNOME/KDE portal capture; scoped Fleet sign-in and reconnecting browser relay; negotiated H.264/HEVC, UTF-8 clipboard, opt-in system audio and confined shared folders; systemd user service/autostart; private persistent state and publication recovery; Linux amd64/arm64 archives and protocol, media and compositor tests. Direct VNC now offers only its implemented password authentication so native viewers no longer select the old ARD stub.
 - Retry disconnected desktop input cleanup during normal operation, bound retained input sessions, keep shutdown responsive during blocked input, reject interrupted browser file requests, preserve folder sharing across codec fallback, recover synchronous H.264 presentation failures, prevent detached relay peers from closing a replacement pairing, and reject quiet mode on platforms without saved-password retrieval.
+- Bound GitHub OAuth token exchange and membership refresh by one 10-second deadline so stalled GitHub responses stop blocking sign-in, thanks @SebTardif (#127).
 - Stop cancelled Share This Mac cursor reconciliation and release video mailbox waits and their timeout tasks promptly, including cancellation before waiter registration, thanks @SebTardif (#114).
 
 ## 0.3.1 - 2026-08-28
