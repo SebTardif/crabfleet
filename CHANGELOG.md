@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add an experimental independent Rust/egui client for Jump Desktop on Linux and browser WASM, with account/MFA and host authentication, discovery, desktop video, keyboard/pointer input, audio, explicit clipboard transfer, remote cursors, view-only controls, and bounded reconnect; validate Mac and Windows hosts plus Firefox and Edge, with provider/SSO login and broader host compatibility still pending.
 - Reject checkout paths containing `#` before generating an incomplete browser audio bundle, and bound Cloudflare domain-management requests to 30 seconds.
 - Fix browser asset generation on Windows and in checkout paths containing spaces, thanks @MohammedAlkindi (#130).
 - Update desktop documentation with platform-specific setup, direct-versus-relay connection guidance, Windows connector limits, and the current discovery API; remove workspace-era navigation and installation hints, and emit the docs 404 page at the correct path.
