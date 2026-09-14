@@ -33,7 +33,9 @@ export async function handleDesktopHostRoute(
   if (request.method === "POST" && desktopHostMatch && url.searchParams.get("recover") === "1") {
     requireRole(user, "viewer");
     const body = await readJson<{ publicationID?: unknown }>(request);
-    return json(await hosts.recover(user, decodePathIdentifier(desktopHostMatch[1]), body.publicationID));
+    return json(
+      await hosts.recover(user, decodePathIdentifier(desktopHostMatch[1]), body.publicationID),
+    );
   }
   if (request.method === "DELETE" && desktopHostMatch) {
     requireRole(user, "viewer");
