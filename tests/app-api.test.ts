@@ -3,89 +3,67 @@ import test from "node:test";
 
 import { api, DEFAULT_FETCH_TIMEOUT_MS } from "../src/app/api.js";
 
-function abortError(): DOMException {
-  return new DOMException("The operation was aborted.", "AbortError");
-}
-
-function hangUntilAborted(_input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
-  return new Promise((_resolve, reject) => {
-    const signal = init?.signal;
-    if (!signal) return;
-    const fail = () => reject(signal.reason ?? abortError());
-    if (signal.aborted) {
-      fail();
-      return;
-    }
-    signal.addEventListener("abort", fail, { once: true });
+test("browser API aborts stalled requests after the default deadline", async (t) => {
+  const timeout = AbortSignal.timeout;
+  const durations: number[] = [];
+  t.mock.method(AbortSignal, "timeout", (duration: number) => {
+    durations.push(duration);
+    return timeout(10);
   });
-}
-
-async function withMockedFetch<T>(
-  mock: typeof fetch,
-  timeoutMs: number | null,
-  run: () => Promise<T>,
-): Promise<{ result: T; timeoutArgs: number[] }> {
-  const originalFetch = globalThis.fetch;
-  const originalTimeout = AbortSignal.timeout;
-  const timeoutArgs: number[] = [];
-  globalThis.fetch = mock;
-  if (timeoutMs !== null) {
-    AbortSignal.timeout = (ms: number) => {
-      timeoutArgs.push(ms);
-      return originalTimeout(timeoutMs);
-    };
-  }
+  t.mock.method(globalThis, "fetch", async (_path: string, options: RequestInit) => {
+    const signal = options.signal!;
+    return new Promise((_resolve, reject) => {
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    });
+  });
+  // Keep the event loop alive while AbortSignal's unreferenced timer runs.
+  const watchdog = setTimeout(() => {}, 1000);
   try {
-    return { result: await run(), timeoutArgs };
+    await assert.rejects(api("/api/fleet"), { name: "TimeoutError" });
+    assert.deepEqual(durations, [DEFAULT_FETCH_TIMEOUT_MS]);
+    assert.equal(DEFAULT_FETCH_TIMEOUT_MS, 30_000);
   } finally {
-    globalThis.fetch = originalFetch;
-    AbortSignal.timeout = originalTimeout;
+    clearTimeout(watchdog);
   }
-}
-
-test("api() aborts a hung fetch with the default timeout", async () => {
-  await withMockedFetch(hangUntilAborted, 20, async () => {
-    const pending = api("/api/state");
-    const watchdog = new Promise<never>((_resolve, reject) => {
-      setTimeout(() => reject(new Error("did not abort hung api() fetch")), 200);
-    });
-    await assert.rejects(Promise.race([pending, watchdog]), (error: unknown) => {
-      assert.ok(error instanceof DOMException);
-      assert.equal(error.name, "TimeoutError");
-      return true;
-    });
-  });
 });
 
-test("api() requests AbortSignal.timeout with the shared default duration", async () => {
-  const { timeoutArgs } = await withMockedFetch(hangUntilAborted, 20, async () => {
-    const pending = api("/api/state");
-    const watchdog = new Promise<never>((_resolve, reject) => {
-      setTimeout(() => reject(new Error("did not abort hung api() fetch")), 200);
-    });
-    await assert.rejects(Promise.race([pending, watchdog]), (error: unknown) => {
-      assert.ok(error instanceof DOMException);
-      assert.equal(error.name, "TimeoutError");
-      return true;
-    });
-    return undefined;
-  });
-  assert.deepEqual(timeoutArgs, [DEFAULT_FETCH_TIMEOUT_MS]);
-});
-
-test("api() keeps a caller-provided signal instead of replacing it", async () => {
+test("browser API preserves caller cancellation and request options", async (t) => {
   const controller = new AbortController();
-  let seen: AbortSignal | undefined;
-  await withMockedFetch(
-    async (_input, init) => {
-      seen = init?.signal;
-      return new Response(JSON.stringify({ ok: true }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
+  const body = JSON.stringify({ value: "@test-person", role: "viewer" });
+  t.mock.method(AbortSignal, "timeout", () => {
+    assert.fail("a caller signal must replace the default deadline");
+  });
+  t.mock.method(globalThis, "fetch", async (path: string, options: RequestInit) => {
+    assert.equal(path, "/api/admin/allow");
+    assert.equal(options.method, "POST");
+    assert.equal(options.body, body);
+    assert.deepEqual(options.headers, {
+      "content-type": "application/json",
+      accept: "application/json",
+    });
+    assert.equal(options.signal, controller.signal);
+    return new Promise((_resolve, reject) => {
+      options.signal!.addEventListener("abort", () => reject(options.signal!.reason), {
+        once: true,
       });
-    },
-    null,
-    async () => api("/api/state", { signal: controller.signal }),
+    });
+  });
+  const pending = api("/api/admin/allow", {
+    method: "POST",
+    body,
+    headers: { accept: "application/json" },
+    signal: controller.signal,
+  });
+  controller.abort();
+  await assert.rejects(pending, { name: "AbortError" });
+});
+
+test("browser API retains JSON results and HTTP error status for session handling", async (t) => {
+  t.mock.method(globalThis, "fetch", async () => Response.json({ user: { name: "Test" } }));
+  assert.deepEqual(await api("/api/session"), { user: { name: "Test" } });
+
+  t.mock.method(globalThis, "fetch", async () =>
+    Response.json({ error: "Sign in again" }, { status: 401 }),
   );
-  assert.equal(seen, controller.signal);
+  await assert.rejects(api("/api/session"), { message: "Sign in again", status: 401 });
 });
