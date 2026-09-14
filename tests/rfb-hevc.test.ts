@@ -7,7 +7,6 @@ import {
   hevcCodecString,
   hevcDescription,
   hevcSampleUnits,
-  hevcUnits,
 } from "../src/app/rfb/hevc.ts";
 
 test("HEVC decoder resets and requests an IRAP after queue saturation", async (t) => {
@@ -247,6 +246,10 @@ function hevcNal(type: number, payload: number[] = [0x80]): Uint8Array {
   return new Uint8Array([type << 1, 1, ...payload]);
 }
 
+function hevcUnits(data: readonly Uint8Array[]) {
+  return data.map((unit) => ({ type: (unit[0]! >> 1) & 0x3f, data: unit }));
+}
+
 function annexBPayload(...units: Uint8Array[]): Uint8Array {
   const escaped = units.map(escapeNal);
   const result = new Uint8Array(escaped.reduce((total, unit) => total + 4 + unit.byteLength, 0));
@@ -354,7 +357,7 @@ class BitWriter {
   }
 }
 
-test("HEVC replaces the decoder when unflagged SPS dimensions change and fences old callbacks", async (t) => {
+test("HEVC leaves acceleration to the browser across SPS changes and fences retired callbacks", async (t) => {
   type Frame = {
     width: number;
     height: number;
@@ -381,6 +384,11 @@ test("HEVC replaces the decoder when unflagged SPS dimensions change and fences 
       instances.push(this);
     }
     configure(configuration: Record<string, unknown>): void {
+      assert.equal(
+        configuration.hardwareAcceleration ?? "no-preference",
+        "no-preference",
+        "configuration must allow the browser to choose hardware or software decoding",
+      );
       this.configuration = configuration;
       this.state = "configured";
     }
