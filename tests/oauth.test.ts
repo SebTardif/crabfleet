@@ -1,11 +1,9 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import {
   githubOAuthCallbackRequestMatches,
   githubOAuthCanonicalLoginUrl,
   githubOAuthCanonicalNativeLinkUrl,
-  githubOAuthCanonicalSshLinkUrl,
   githubOAuthRedirectUri,
 } from "../src/oauth.ts";
 import { githubCallback, githubLogin } from "../src/worker/github-auth.ts";
@@ -104,33 +102,6 @@ test("configured GitHub origin is authoritative across host mismatches", () => {
   );
 });
 
-test("SSH link state canonicalizes before host-only OAuth cookies", async () => {
-  const configured = "https://fleet.example/auth/github/callback";
-  assert.equal(
-    githubOAuthCanonicalSshLinkUrl(
-      "https://alias.example/ssh/link/code%2Fwith%2Fslashes",
-      "code/with/slashes",
-      configured,
-    ),
-    "https://fleet.example/ssh/link/code%2Fwith%2Fslashes",
-  );
-  assert.equal(
-    githubOAuthCanonicalSshLinkUrl(
-      "https://fleet.example/ssh/link/code%2Fwith%2Fslashes",
-      "code/with/slashes",
-      configured,
-    ),
-    null,
-  );
-  const source = await readFile(new URL("../src/worker/ssh-gateway.ts", import.meta.url), "utf8");
-  const linkStart = source.indexOf("async link(");
-  const linkEnd = source.indexOf("async authenticate(", linkStart);
-  const linkSource = source.slice(linkStart, linkEnd);
-  assert.match(linkSource, /githubOAuthCanonicalSshLinkUrl/);
-  assert.ok(linkSource.indexOf("canonicalLinkUrl") < linkSource.indexOf("sshLinkCookie"));
-  assert.match(linkSource, /redirect\("\/login\/github\?flow=ssh"/);
-});
-
 test("native link state canonicalizes to the authoritative OAuth origin", () => {
   const configured = "https://fleet.example/auth/github/callback";
   assert.equal(
@@ -227,7 +198,7 @@ test("OAuth state binds the intended link flow instead of stale competing cookie
     {
       query: "?flow=ssh",
       pendingCookies: "crabbox_ssh_link=new-ssh; crabbox_native_link=stale-native",
-      expected: "/ssh/link/new-ssh",
+      expected: "/app?login=github",
     },
     {
       query: "",
@@ -242,6 +213,11 @@ test("OAuth state binds the intended link flow instead of stale competing cookie
       env,
     );
     const authorize = new URL(login.headers.get("location") ?? "");
+    assert.deepEqual(authorize.searchParams.get("scope")?.split(" "), [
+      "read:user",
+      "user:email",
+      "read:org",
+    ]);
     const state = authorize.searchParams.get("state");
     const stateCookie = login.headers.get("set-cookie")?.split(";", 1)[0];
     assert.ok(state);
@@ -331,51 +307,83 @@ test("OAuth token exchange and membership refresh pass an AbortSignal", async ()
   assert.ok(refreshCalls.every((row) => row.hasSignal));
 });
 
-test("OAuth token exchange aborts when GitHub never answers", async () => {
+test("OAuth token exchange aborts when GitHub never answers", async (t) => {
   const env = {
     GITHUB_CLIENT_ID: "client-id",
     GITHUB_CLIENT_SECRET: "client-secret",
     GITHUB_REDIRECT_URI: "https://fleet.example/auth/github/callback",
   } as RuntimeEnv;
-  const origTimeout = AbortSignal.timeout.bind(AbortSignal);
+  const controller = new AbortController();
   const requested: number[] = [];
-  AbortSignal.timeout = (ms: number) => {
+  t.mock.method(AbortSignal, "timeout", (ms: number) => {
     requested.push(ms);
-    return origTimeout(ms === 10_000 ? 20 : ms);
-  };
-  try {
-    const hung: Fetcher = (_input, init) =>
-      new Promise((_resolve, reject) => {
-        const signal = init?.signal;
-        if (!signal) {
-          return;
-        }
-        const fail = () => {
-          reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
-        };
-        if (signal.aborted) {
-          fail();
-          return;
-        }
-        signal.addEventListener("abort", fail, { once: true });
+    return controller.signal;
+  });
+  const hung: Fetcher = (_input, init) =>
+    new Promise((_resolve, reject) => {
+      const signal = init?.signal;
+      if (!signal) {
+        return;
+      }
+      const fail = () => {
+        reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+      };
+      if (signal.aborted) {
+        fail();
+        return;
+      }
+      signal.addEventListener("abort", fail, { once: true });
+    });
+  const pending = githubCallback(
+    new Request("https://fleet.example/auth/github/callback?code=code&state=state", {
+      headers: { cookie: "crabbox_oauth_state=state" },
+    }),
+    env,
+    hung,
+  );
+  controller.abort(new DOMException("Deadline exceeded", "TimeoutError"));
+  await assert.rejects(pending, { name: "TimeoutError" });
+  assert.deepEqual(requested, [10_000]);
+});
+
+test("OAuth membership refresh inherits the token exchange deadline", async (t) => {
+  const controller = new AbortController();
+  const requested: number[] = [];
+  t.mock.method(AbortSignal, "timeout", (ms: number) => {
+    requested.push(ms);
+    return controller.signal;
+  });
+  const refreshing = Promise.withResolvers<void>();
+  const fetcher: Fetcher = async (input, init) => {
+    assert.equal(init?.signal, controller.signal);
+    if (String(input).startsWith("https://github.com/")) {
+      return Response.json({ access_token: "github-token" });
+    }
+    refreshing.resolve();
+    return new Promise((_resolve, reject) => {
+      controller.signal.addEventListener("abort", () => reject(controller.signal.reason), {
+        once: true,
       });
-    await assert.rejects(
-      githubCallback(
-        new Request("https://fleet.example/auth/github/callback?code=code&state=state", {
-          headers: { cookie: "crabbox_oauth_state=state" },
-        }),
-        env,
-        hung,
-      ),
-      (error: unknown) => {
-        assert.equal((error as Error).name, "TimeoutError");
-        return true;
-      },
-    );
-    assert.deepEqual(requested, [10_000]);
-  } finally {
-    AbortSignal.timeout = origTimeout;
-  }
+    });
+  };
+  const pending = githubCallback(
+    new Request("https://fleet.example/auth/github/callback?code=code&state=state", {
+      headers: { cookie: "crabbox_oauth_state=state" },
+    }),
+    {
+      GITHUB_CLIENT_ID: "client-id",
+      GITHUB_CLIENT_SECRET: "client-secret",
+      GITHUB_REDIRECT_URI: "https://fleet.example/auth/github/callback",
+    } as RuntimeEnv,
+    fetcher,
+  );
+  await refreshing.promise;
+  controller.abort(new DOMException("Deadline exceeded", "TimeoutError"));
+  await assert.rejects(pending, {
+    status: 503,
+    message: "GitHub membership refresh failed; retry later",
+  });
+  assert.deepEqual(requested, [10_000]);
 });
 
 test("GitHub membership refresh reports incomplete email evidence without breaking callers", async () => {
