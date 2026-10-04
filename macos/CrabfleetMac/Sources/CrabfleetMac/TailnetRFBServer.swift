@@ -1691,7 +1691,9 @@ final class RFBHostSession: @unchecked Sendable {
     )
     guard let payload else { return }
     Task {
-      try? await io.send(payload)
+      // Same deadline cap as cursor and audio writes. An undeadlined send
+      // stays queued for a viewer whose window never opens.
+      try? await io.send(payload, timeout: .milliseconds(100))
     }
   }
 
