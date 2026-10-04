@@ -5,6 +5,27 @@ import Testing
 
 struct RelayHostPublisherTests {
   @Test
+  func largeConsumeDropsRetainedStorage() {
+    var buffer = RelayIncomingBuffer()
+    let size = 2_000_000
+    buffer.append(Data(count: size))
+    #expect(buffer.retainedStartIndex == 0)
+    #expect(buffer.retainedAllocationBytes >= size)
+
+    let consumed = buffer.consume(1_500_000)
+    #expect(consumed.count == 1_500_000)
+    #expect(buffer.count == 500_000)
+    #expect(buffer.retainedStartIndex == 0)
+    #expect(buffer.retainedAllocationBytes > 0)
+    #expect(buffer.retainedAllocationBytes < 1_000_000)
+
+    _ = buffer.consume(buffer.count)
+    #expect(buffer.count == 0)
+    #expect(buffer.retainedStartIndex == 0)
+    #expect(buffer.retainedAllocationBytes == 0)
+  }
+
+  @Test
   func websocketByteStreamReassemblesReadsAndChunksWrites() async throws {
     let task = RecordingRelayWebSocketTask(incoming: [
       .data(Data([1, 2])),
