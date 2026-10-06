@@ -1,5 +1,7 @@
 import AppKit
 import Foundation
+import Network
+import os
 import RoyalVNCKit
 import Testing
 
@@ -655,6 +657,91 @@ struct RFBHostSessionStreamTests {
     let blocked = TightResizeRecorder(allowResize: false)
     try await runTightFallback(recorder: blocked)
     #expect(blocked.events == ["begin"])
+  }
+
+  @Test
+  func tightFallbackResizesTheLiveScreenCapture() async throws {
+    let capture = MacScreenCapture()
+    capture.retainConsumer(id: UUID())
+    let live = try await capture.start()
+    var thrown: Error?
+    do {
+      let initial = try await waitForCapturedFrame(capture, timeout: .seconds(5))
+      let enlargedWidth = max(live.sourcePixelWidth, 3_840)
+      let enlargedHeight = max(live.sourcePixelHeight, 2_160)
+      let enlarged = CapturedDisplayDescriptor(
+        displayID: live.displayID,
+        displayBounds: live.displayBounds,
+        frameWidth: enlargedWidth,
+        frameHeight: enlargedHeight,
+        sourcePixelWidth: live.sourcePixelWidth,
+        sourcePixelHeight: live.sourcePixelHeight)
+      let target = MacScreenCapture.resizedDimensions(
+        requestedWidth: enlargedWidth,
+        requestedHeight: enlargedHeight,
+        sourcePixelWidth: live.sourcePixelWidth,
+        sourcePixelHeight: live.sourcePixelHeight)
+      let peer = LoopbackTCPPeer()
+      let port = try await peer.listen()
+      defer { peer.stop() }
+      async let clientReady: Void = peer.connectClient(port: port)
+      async let serverConnection = peer.acceptedConnection()
+      try await clientReady
+      let server = try await serverConnection
+      let finished = ThreadSafeFlag()
+      let session = RFBHostSession(
+        byteStream: RFBConnectionIO(connection: server),
+        capture: capture,
+        descriptor: enlarged,
+        input: HandshakeRemoteInput(),
+        clipboard: nil,
+        remoteAddressOverride: "127.0.0.1",
+        skipTailnetCheck: true,
+        security: .listener(TestLegacyNoneAuthentication()),
+        desktopName: "Crabfleet tight capture",
+        handshakeTimeout: .seconds(2),
+        viewOnly: false,
+        audioEnabled: false,
+        qualityMode: .auto,
+        didAuthorize: {},
+        eventHandler: { _ in },
+        didFinish: { _ in finished.set() })
+      session.start()
+      defer { session.stop() }
+      try await peer.performNoneHandshake(desktopName: "Crabfleet tight capture")
+      peer.startIncomingReader()
+      try await peer.send(
+        clientSetEncodings([
+          RFBWire.tightEncoding,
+          RFBWire.extendedDesktopSizeEncoding,
+        ]))
+      let wireDeadline = ContinuousClock().now.advanced(by: .seconds(3))
+      var wire = Data()
+      var announced: (width: Int, height: Int)?
+      while ContinuousClock().now < wireDeadline {
+        wire = peer.incomingSnapshot()
+        announced = framebufferSize(wire)
+        if announced != nil { break }
+        try await Task.sleep(for: .milliseconds(20))
+      }
+      let size = try #require(announced)
+      let resized = try await waitForCapturedFrame(
+        capture,
+        timeout: .seconds(3),
+        matching: { $0.width == target.width && $0.height == target.height })
+      #expect(size.width == target.width)
+      #expect(size.height == target.height)
+      #expect(resized.width == target.width)
+      #expect(resized.height == target.height)
+      #expect(!finished.value)
+      print(
+        "{\"event\":\"tight_live_resize\",\"port\":\(port),\"initialWidth\":\(initial.width),\"initialHeight\":\(initial.height),\"sourcePixelWidth\":\(live.sourcePixelWidth),\"sourcePixelHeight\":\(live.sourcePixelHeight),\"targetWidth\":\(target.width),\"targetHeight\":\(target.height),\"wireWidth\":\(size.width),\"wireHeight\":\(size.height),\"frameWidth\":\(resized.width),\"frameHeight\":\(resized.height)}"
+      )
+    } catch {
+      thrown = error
+    }
+    await capture.stop()
+    if let thrown { throw thrown }
   }
 
   @Test
@@ -1562,6 +1649,229 @@ private final class RecordingHostRelayWebSocketTask: RelayWebSocketTasking, @unc
     lock.lock()
     defer { lock.unlock() }
     return try body()
+  }
+}
+
+private func waitForCapturedFrame(
+  _ capture: MacScreenCapture,
+  timeout: Duration,
+  matching: ((CapturedDesktopFrame) -> Bool)? = nil
+) async throws -> CapturedDesktopFrame {
+  let deadline = ContinuousClock().now.advanced(by: timeout)
+  while ContinuousClock().now < deadline {
+    if let frame = await capture.frameStore.latest() {
+      if matching?(frame) ?? true { return frame }
+    }
+    try await Task.sleep(for: .milliseconds(30))
+  }
+  throw URLError(.timedOut)
+}
+
+private func framebufferSize(_ data: Data) -> (width: Int, height: Int)? {
+  var offset = 0
+  while offset + 12 <= data.count {
+    if data[offset] == 0, data[offset + 1] == 0 {
+      let width = (Int(data[offset + 8]) << 8) | Int(data[offset + 9])
+      let height = (Int(data[offset + 10]) << 8) | Int(data[offset + 11])
+      if width >= 2, height >= 2 { return (width, height) }
+    }
+    offset += 1
+  }
+  return nil
+}
+
+private final class LoopbackTCPPeer: @unchecked Sendable {
+  private let lock = NSLock()
+  private let incoming = OSAllocatedUnfairLock(initialState: Data())
+  private var listener: NWListener?
+  private var accepted: NWConnection?
+  private var client: NWConnection?
+  private var acceptWaiter: CheckedContinuation<NWConnection, Error>?
+  private var reader: Task<Void, Never>?
+
+  func listen() async throws -> UInt16 {
+    let listener = try NWListener(using: .tcp, on: .any)
+    self.listener = listener
+    listener.newConnectionHandler = { [weak self] connection in
+      self?.accept(connection)
+    }
+    return try await withCheckedThrowingContinuation { continuation in
+      let resumed = OSAllocatedUnfairLock(initialState: false)
+      listener.stateUpdateHandler = { state in
+        let action: Result<UInt16, Error>?
+        switch state {
+        case .ready:
+          action = .success(listener.port?.rawValue ?? 0)
+        case .failed(let error):
+          action = .failure(error)
+        default:
+          action = nil
+        }
+        guard let action else { return }
+        let shouldResume = resumed.withLock { value in
+          if value { return false }
+          value = true
+          return true
+        }
+        guard shouldResume else { return }
+        continuation.resume(with: action)
+      }
+      listener.start(queue: .global())
+    }
+  }
+
+  func connectClient(port: UInt16) async throws {
+    let connection = NWConnection(
+      host: NWEndpoint.Host("127.0.0.1"),
+      port: NWEndpoint.Port(rawValue: port) ?? .any,
+      using: .tcp)
+    client = connection
+    try await waitUntilReady(connection)
+  }
+
+  func acceptedConnection() async throws -> NWConnection {
+    let connection: NWConnection = try await withCheckedThrowingContinuation { continuation in
+      lock.lock()
+      if let accepted {
+        lock.unlock()
+        continuation.resume(returning: accepted)
+        return
+      }
+      acceptWaiter = continuation
+      lock.unlock()
+    }
+    try await waitUntilReady(connection)
+    return connection
+  }
+
+  func performNoneHandshake(desktopName: String) async throws {
+    let banner = try await readExactly(12)
+    #expect(banner == RFBVersion.serverBanner)
+    try await send(RFBVersion.serverBanner)
+    let security = try await readExactly(2)
+    #expect(security == Data([1, 1]))
+    try await send(Data([1]))
+    let result = try await readExactly(4)
+    #expect(result == Data([0, 0, 0, 0]))
+    try await send(Data([1]))
+    let header = try await readExactly(24)
+    let nameLength = (Int(header[20]) << 24)
+      | (Int(header[21]) << 16)
+      | (Int(header[22]) << 8)
+      | Int(header[23])
+    let name = try await readExactly(nameLength)
+    #expect(String(data: name, encoding: .utf8) == desktopName)
+  }
+
+  func send(_ data: Data) async throws {
+    guard let client else { throw URLError(.cannotConnectToHost) }
+    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+      client.send(content: data, completion: .contentProcessed { error in
+        if let error {
+          continuation.resume(throwing: error)
+        } else {
+          continuation.resume()
+        }
+      })
+    }
+  }
+
+  func startIncomingReader() {
+    reader = Task { [weak self] in
+      guard let self else { return }
+      while !Task.isCancelled {
+        do {
+          let chunk = try await self.receiveOnce(maximum: 65_536)
+          guard !chunk.isEmpty else { continue }
+          self.incoming.withLock { $0.append(chunk) }
+        } catch {
+          return
+        }
+      }
+    }
+  }
+
+  func incomingSnapshot() -> Data {
+    incoming.withLock { $0 }
+  }
+
+  func stop() {
+    reader?.cancel()
+    client?.cancel()
+    accepted?.cancel()
+    listener?.cancel()
+  }
+
+  private func accept(_ connection: NWConnection) {
+    lock.lock()
+    if accepted != nil {
+      lock.unlock()
+      connection.cancel()
+      return
+    }
+    accepted = connection
+    let waiter = acceptWaiter
+    acceptWaiter = nil
+    lock.unlock()
+    waiter?.resume(returning: connection)
+  }
+
+  private func waitUntilReady(_ connection: NWConnection) async throws {
+    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+      let resumed = OSAllocatedUnfairLock(initialState: false)
+      connection.stateUpdateHandler = { state in
+        let action: Result<Void, Error>?
+        switch state {
+        case .ready:
+          action = .success(())
+        case .failed(let error):
+          action = .failure(error)
+        case .cancelled:
+          action = .failure(URLError(.cancelled))
+        default:
+          action = nil
+        }
+        guard let action else { return }
+        let shouldResume = resumed.withLock { value in
+          if value { return false }
+          value = true
+          return true
+        }
+        guard shouldResume else { return }
+        continuation.resume(with: action)
+      }
+      connection.start(queue: .global())
+    }
+  }
+
+  private func readExactly(_ count: Int) async throws -> Data {
+    var result = Data()
+    let deadline = ContinuousClock().now.advanced(by: .seconds(3))
+    while result.count < count {
+      if ContinuousClock().now >= deadline { throw URLError(.timedOut) }
+      let chunk = try await receiveOnce(maximum: count - result.count)
+      guard !chunk.isEmpty else { throw URLError(.networkConnectionLost) }
+      result.append(chunk)
+    }
+    return result
+  }
+
+  private func receiveOnce(maximum: Int) async throws -> Data {
+    guard let client else { throw URLError(.cannotConnectToHost) }
+    return try await withCheckedThrowingContinuation { continuation in
+      client.receive(minimumIncompleteLength: 1, maximumLength: maximum) {
+        data, _, isComplete, error in
+        if let error {
+          continuation.resume(throwing: error)
+        } else if let data, !data.isEmpty {
+          continuation.resume(returning: data)
+        } else if isComplete {
+          continuation.resume(throwing: URLError(.networkConnectionLost))
+        } else {
+          continuation.resume(returning: Data())
+        }
+      }
+    }
   }
 }
 

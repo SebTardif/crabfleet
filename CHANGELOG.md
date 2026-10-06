@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Keep a Tight viewer from resizing the shared screen capture unless it holds the resize gate.
+
 ## 0.4.0 - 2026-09-24
 
 **Highlights:** Native VNC and private desktop sharing now include a Linux connector, stronger browser session handling, and an experimental Linux/web Jump Desktop client; source builds require Go 1.26 or later.
