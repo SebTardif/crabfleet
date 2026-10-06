@@ -19,10 +19,12 @@ extension URLSessionWebSocketTask: RelayWebSocketTasking {}
 /// already delivered.
 struct RelayIncomingBuffer {
   private var storage = Data()
+  private var start = 0
+  private let compactMinimumBytes = 64 * 1_024
 
-  var count: Int { storage.count }
+  var count: Int { storage.count - start }
 
-  var retainedStartIndex: Int { storage.startIndex }
+  var retainedStartIndex: Int { start }
 
   var retainedAllocationBytes: Int {
     storage.withUnsafeBytes { raw in
@@ -32,18 +34,32 @@ struct RelayIncomingBuffer {
   }
 
   mutating func append(_ data: Data) {
+    if shouldCompact { compact() }
     storage.append(data)
   }
 
   mutating func consume(_ count: Int) -> Data {
-    precondition(count >= 0 && count <= storage.count)
-    let result = Data(storage.prefix(count))
-    if count == storage.count {
+    precondition(count >= 0 && count <= self.count)
+    let lower = storage.startIndex + start
+    let result = Data(storage[lower..<(lower + count)])
+    start += count
+    if start == storage.count {
       storage = Data()
-    } else {
-      storage = Data(storage.dropFirst(count))
+      start = 0
+    } else if shouldCompact {
+      compact()
     }
     return result
+  }
+
+  private var shouldCompact: Bool {
+    start >= compactMinimumBytes && start * 2 >= storage.count
+  }
+
+  private mutating func compact() {
+    guard start > 0 else { return }
+    storage = Data(storage.dropFirst(start))
+    start = 0
   }
 }
 

@@ -27,6 +27,18 @@ struct RelayHostPublisherTests {
   }
 
   @Test
+  func smallConsumeKeepsTheUnreadSuffixInPlace() {
+    var buffer = RelayIncomingBuffer()
+    buffer.append(Data(repeating: 7, count: 200_000))
+    let allocation = buffer.retainedAllocationBytes
+    let first = buffer.consume(16)
+    #expect(first == Data(repeating: 7, count: 16))
+    #expect(buffer.count == 199_984)
+    #expect(buffer.retainedStartIndex == 16)
+    #expect(buffer.retainedAllocationBytes == allocation)
+  }
+
+  @Test
   func websocketByteStreamReassemblesReadsAndChunksWrites() async throws {
     let task = RecordingRelayWebSocketTask(incoming: [
       .data(Data([1, 2])),
@@ -179,8 +191,17 @@ struct RelayHostPublisherTests {
     let second = try await stream.readExactly(150_000)
     let milliseconds = (DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
     #expect(first + second == payload)
+    let small = Data(repeating: 9, count: 64_000)
+    try await server.send(small)
+    let smallStarted = DispatchTime.now().uptimeNanoseconds
+    var reassembled = Data()
+    for _ in 0..<4_000 {
+      reassembled.append(try await stream.readExactly(16))
+    }
+    let smallMilliseconds = (DispatchTime.now().uptimeNanoseconds - smallStarted) / 1_000_000
+    #expect(reassembled == small)
     print(
-      "{\"event\":\"relay_url_session\",\"port\":\(port),\"frames\":2,\"readBytes\":\(first.count + second.count),\"milliseconds\":\(milliseconds)}"
+      "{\"event\":\"relay_url_session\",\"port\":\(port),\"frames\":2,\"readBytes\":\(first.count + second.count),\"milliseconds\":\(milliseconds),\"smallReads\":4000,\"smallReadBytes\":\(reassembled.count),\"smallReadMilliseconds\":\(smallMilliseconds)}"
     )
     stream.cancel()
   }
