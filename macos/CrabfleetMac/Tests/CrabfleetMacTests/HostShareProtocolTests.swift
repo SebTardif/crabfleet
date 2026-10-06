@@ -1185,8 +1185,10 @@ struct RFBHostSessionStreamTests {
     let stalledMarkers = stalledPayloads.compactMap {
       String(data: $0.prefix(2), encoding: .isoLatin1)
     }
+    let allowedMarkers = Set((0..<pushed).map { "M\($0)" })
     #expect((1...2).contains(stalledPayloads.count))
-    #expect(Set(stalledMarkers).isSubset(of: ["M0", "M1"]))
+    #expect(Set(stalledMarkers).isSubset(of: allowedMarkers))
+    #expect(Set(stalledMarkers).count == stalledMarkers.count)
 
     try await Task.sleep(for: .milliseconds(100))
     clipboard.push("RECOVERED")
