@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 import Network
 import os
@@ -435,6 +436,35 @@ struct CursorPipelinePolicyTests {
 
 struct RFBHostSessionStreamTests {
   @Test
+  func loopbackTcpPeerAcceptsOnlyLoopback() async throws {
+    let peer = LoopbackTCPPeer()
+    let port = try await peer.listen()
+    defer { peer.stop() }
+    try await peer.connectClient(port: port)
+    let accepted = try await peer.acceptedConnection()
+    guard case .hostPort(let host, _) = accepted.currentPath?.localEndpoint else {
+      Issue.record("accepted connection has no local host")
+      return
+    }
+    #expect(String(describing: host) == "127.0.0.1")
+    let lanAddress = try #require(firstRoutableIPv4())
+    let outsider = NWConnection(
+      host: NWEndpoint.Host(lanAddress),
+      port: NWEndpoint.Port(rawValue: port) ?? .any,
+      using: .tcp)
+    let outsiderReady = OSAllocatedUnfairLock(initialState: false)
+    outsider.stateUpdateHandler = { state in
+      if case .ready = state {
+        outsiderReady.withLock { $0 = true }
+      }
+    }
+    outsider.start(queue: .global())
+    try await Task.sleep(for: .milliseconds(400))
+    #expect(outsiderReady.withLock { $0 } == false)
+    outsider.cancel()
+  }
+
+  @Test
   func readsAByteFromDataWithANonzeroStartIndex() async throws {
     #expect(try await SlicedRFBByteStream().readUInt8() == 42)
   }
@@ -659,7 +689,10 @@ struct RFBHostSessionStreamTests {
     #expect(blocked.events == ["begin"])
   }
 
-  @Test
+  @Test(
+    .enabled(
+      if: ProcessInfo.processInfo.environment["CRABFLEET_LIVE_SCREEN_CAPTURE"] == "1",
+      "live ScreenCaptureKit needs Screen Recording permission"))
   func tightFallbackResizesTheLiveScreenCapture() async throws {
     let capture = MacScreenCapture()
     capture.retainConsumer(id: UUID())
@@ -1680,6 +1713,34 @@ private func framebufferSize(_ data: Data) -> (width: Int, height: Int)? {
   return nil
 }
 
+private func firstRoutableIPv4() -> String? {
+  var head: UnsafeMutablePointer<ifaddrs>?
+  guard getifaddrs(&head) == 0 else { return nil }
+  defer { freeifaddrs(head) }
+  var cursor = head
+  while let current = cursor {
+    cursor = current.pointee.ifa_next
+    let flags = Int32(current.pointee.ifa_flags)
+    guard flags & IFF_UP != 0, flags & IFF_LOOPBACK == 0,
+      let address = current.pointee.ifa_addr,
+      address.pointee.sa_family == sa_family_t(AF_INET)
+    else { continue }
+    var storage = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+    let copied = getnameinfo(
+      address,
+      socklen_t(address.pointee.sa_len),
+      &storage,
+      socklen_t(storage.count),
+      nil,
+      0,
+      NI_NUMERICHOST)
+    guard copied == 0 else { continue }
+    let host = String(cString: storage)
+    if host != "127.0.0.1" { return host }
+  }
+  return nil
+}
+
 private final class LoopbackTCPPeer: @unchecked Sendable {
   private let lock = NSLock()
   private let incoming = OSAllocatedUnfairLock(initialState: Data())
@@ -1690,7 +1751,9 @@ private final class LoopbackTCPPeer: @unchecked Sendable {
   private var reader: Task<Void, Never>?
 
   func listen() async throws -> UInt16 {
-    let listener = try NWListener(using: .tcp, on: .any)
+    let parameters = NWParameters.tcp
+    parameters.requiredLocalEndpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: .any)
+    let listener = try NWListener(using: parameters)
     self.listener = listener
     listener.newConnectionHandler = { [weak self] connection in
       self?.accept(connection)
