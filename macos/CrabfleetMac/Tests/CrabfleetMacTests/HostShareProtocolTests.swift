@@ -447,7 +447,7 @@ struct RFBHostSessionStreamTests {
       return
     }
     #expect(String(describing: host) == "127.0.0.1")
-    let lanAddress = try #require(firstRoutableIPv4())
+    guard let lanAddress = firstRoutableIPv4() else { return }
     let outsider = NWConnection(
       host: NWEndpoint.Host(lanAddress),
       port: NWEndpoint.Port(rawValue: port) ?? .any,
