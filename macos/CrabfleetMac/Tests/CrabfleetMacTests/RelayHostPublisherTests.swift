@@ -1,5 +1,4 @@
 import Foundation
-import Network
 import Testing
 
 @testable import CrabfleetMac
@@ -174,147 +173,20 @@ struct RelayHostPublisherTests {
   }
 
   @Test
-  func urlSessionRelayReadsBinaryFrames() async throws {
+  func relayReassemblesManySmallReadsAcrossCompaction() async throws {
     let payload = Data((0..<400_000).map { UInt8($0 % 251) })
-    let server = LocalBinaryWebSocket()
-    let port = try await server.listen()
-    defer { server.stop() }
-    let session = URLSession(configuration: .ephemeral)
-    defer { session.invalidateAndCancel() }
-    let task = session.webSocketTask(with: URL(string: "ws://127.0.0.1:\(port)/relay")!)
+    let task = RecordingRelayWebSocketTask(incoming: [
+      .data(Data(payload.prefix(200_000))),
+      .data(Data(payload.dropFirst(200_000))),
+      .data(Data([42])),
+    ])
     let stream = RelayWebSocketByteStream(task: task)
-    task.resume()
-    try await server.send(Data(payload.prefix(200_000)))
-    try await server.send(Data(payload.dropFirst(200_000)))
-    let started = DispatchTime.now().uptimeNanoseconds
-    let first = try await stream.readExactly(250_000)
-    let second = try await stream.readExactly(150_000)
-    let milliseconds = (DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
-    #expect(first + second == payload)
-    let small = Data(repeating: 9, count: 64_000)
-    try await server.send(small)
-    let smallStarted = DispatchTime.now().uptimeNanoseconds
     var reassembled = Data()
-    for _ in 0..<4_000 {
+    for _ in 0..<25_000 {
       reassembled.append(try await stream.readExactly(16))
     }
-    let smallMilliseconds = (DispatchTime.now().uptimeNanoseconds - smallStarted) / 1_000_000
-    #expect(reassembled == small)
-    print(
-      "{\"event\":\"relay_url_session\",\"port\":\(port),\"frames\":2,\"readBytes\":\(first.count + second.count),\"milliseconds\":\(milliseconds),\"smallReads\":4000,\"smallReadBytes\":\(reassembled.count),\"smallReadMilliseconds\":\(smallMilliseconds)}"
-    )
-    stream.cancel()
-  }
-}
-
-private final class LocalBinaryWebSocket: @unchecked Sendable {
-  private let lock = NSLock()
-  private var listener: NWListener?
-  private var connection: NWConnection?
-  private var isReady = false
-  private var readyWaiter: CheckedContinuation<Void, Error>?
-
-  func listen() async throws -> UInt16 {
-    let socketOptions = NWProtocolWebSocket.Options()
-    socketOptions.autoReplyPing = true
-    let parameters = NWParameters.tcp
-    parameters.defaultProtocolStack.applicationProtocols.insert(socketOptions, at: 0)
-    let listener = try NWListener(using: parameters, on: .any)
-    self.listener = listener
-    listener.newConnectionHandler = { [weak self] connection in
-      self?.accept(connection)
-    }
-    return try await withCheckedThrowingContinuation { continuation in
-      listener.stateUpdateHandler = { state in
-        switch state {
-        case .ready:
-          continuation.resume(returning: listener.port?.rawValue ?? 0)
-          listener.stateUpdateHandler = { _ in }
-        case .failed(let error):
-          continuation.resume(throwing: error)
-          listener.stateUpdateHandler = { _ in }
-        default:
-          break
-        }
-      }
-      listener.start(queue: .global())
-    }
-  }
-
-  func send(_ data: Data) async throws {
-    try await waitUntilReady()
-    guard let connection else { throw URLError(.cannotConnectToHost) }
-    let metadata = NWProtocolWebSocket.Metadata(opcode: .binary)
-    let context = NWConnection.ContentContext(identifier: "binary", metadata: [metadata])
-    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-      connection.send(
-        content: data,
-        contentContext: context,
-        isComplete: true,
-        completion: .contentProcessed { error in
-          if let error {
-            continuation.resume(throwing: error)
-          } else {
-            continuation.resume()
-          }
-        }
-      )
-    }
-  }
-
-  func stop() {
-    connection?.cancel()
-    listener?.cancel()
-  }
-
-  private func accept(_ connection: NWConnection) {
-    connection.stateUpdateHandler = { [weak self] state in
-      guard let self else { return }
-      switch state {
-      case .ready:
-        self.lock.lock()
-        self.isReady = true
-        let waiter = self.readyWaiter
-        self.readyWaiter = nil
-        self.lock.unlock()
-        waiter?.resume()
-      case .failed(let error):
-        self.lock.lock()
-        let waiter = self.readyWaiter
-        self.readyWaiter = nil
-        self.lock.unlock()
-        waiter?.resume(throwing: error)
-      default:
-        break
-      }
-    }
-    lock.lock()
-    self.connection = connection
-    lock.unlock()
-    connection.start(queue: .global())
-  }
-
-  private func waitUntilReady() async throws {
-    if readyNow() { return }
-    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-      if installWaiter(continuation) {
-        continuation.resume()
-      }
-    }
-  }
-
-  private func readyNow() -> Bool {
-    lock.lock()
-    defer { lock.unlock() }
-    return isReady
-  }
-
-  private func installWaiter(_ continuation: CheckedContinuation<Void, Error>) -> Bool {
-    lock.lock()
-    defer { lock.unlock() }
-    if isReady { return true }
-    readyWaiter = continuation
-    return false
+    #expect(reassembled == payload)
+    #expect(try await stream.readExactly(1) == Data([42]))
   }
 }
 

@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Release consumed Mac relay bytes without copying the unread tail on every small read.
+- Release consumed Mac relay bytes without copying the unread tail on every small read, thanks @SebTardif (#151).
 
 ## 0.4.0 - 2026-09-24
 
