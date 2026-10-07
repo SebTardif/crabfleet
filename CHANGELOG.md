@@ -2,7 +2,8 @@
 
 ## Unreleased
 
-- Bound host clipboard pushes while a viewer is stalled, and deliver a later push after the viewer reads.
+- Release consumed Mac relay bytes without copying the unread tail on every small read, thanks @SebTardif (#151).
+- Bound Mac host clipboard pushes behind stalled viewers and allow fresh updates after recovery, thanks @SebTardif (#153).
 
 ## 0.4.0 - 2026-09-24
 
