@@ -2,7 +2,8 @@
 
 ## Unreleased
 
-- Keep a Tight viewer from resizing the shared screen capture unless it holds the resize gate.
+- Keep Tight fallback from resizing a shared Mac capture without exclusive resize ownership, and release the gate after failed updates, thanks @SebTardif (#152).
+- Release consumed Mac relay bytes without copying the unread tail on every small read, thanks @SebTardif (#151).
 
 ## 0.4.0 - 2026-09-24
 
